@@ -3,6 +3,7 @@ import argparse
 import os
 import random
 import time
+from collections import deque
 from distutils.util import strtobool
 
 import envpool
@@ -251,6 +252,7 @@ if __name__ == "__main__":
         optimize_memory_usage=True,
         handle_timeout_termination=True,
     )
+    avg_returns = deque(maxlen=20)
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
@@ -273,14 +275,13 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         for idx, d in enumerate(dones):
-            info = infos[idx]
-            if d and info["lives"][idx] == 0:
-                if "episode" in info.keys():
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                    writer.add_scalar("charts/epsilon", epsilon, global_step)
-                    break
+            if d and infos["lives"][idx] == 0:
+                print(f"global_step={global_step}, episodic_return={infos['r'][idx]}")
+                avg_returns.append(infos["r"][idx])
+                writer.add_scalar("charts/episodic_return", infos["r"][idx], global_step)
+                writer.add_scalar("charts/episodic_length", infos["l"][idx], global_step)
+                writer.add_scalar("charts/epsilon", epsilon, global_step)
+                break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
