@@ -223,6 +223,7 @@ if __name__ == "__main__":
         seed=args.seed,
     )
     envs = RecordEpisodeStatistics(envs)
+    envs.num_envs = args.num_envs
     envs.single_action_space = envs.action_space
     envs.single_observation_space = envs.observation_space
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
