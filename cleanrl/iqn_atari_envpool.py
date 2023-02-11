@@ -223,8 +223,9 @@ if __name__ == "__main__":
         seed=args.seed,
     )
     envs = RecordEpisodeStatistics(envs)
-    assert isinstance(envs.action_space, gym.spaces.Discrete), "only discrete action space is supported"
-    
+    envs.single_action_space = envs.action_space
+    envs.single_observation_space = envs.observation_space
+    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     q_network = QNetwork().to(device)
     target_q_network = QNetwork().to(device)
