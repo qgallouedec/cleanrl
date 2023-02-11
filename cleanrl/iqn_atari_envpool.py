@@ -265,7 +265,7 @@ if __name__ == "__main__":
             tau_embeddings = cosine_network(taus)
             quantiles = quantile_network(embeddings, tau_embeddings)  # (num_quantile_samples, num_actions)
             q_values = torch.mean(quantiles, dim=1)  # (num_actions,)
-            action = torch.argmax(q_values, dim=1).cpu().numpy()
+            actions = torch.argmax(q_values, dim=1, keepdim=True).cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, dones, infos = envs.step(actions)
