@@ -83,8 +83,6 @@ def parse_args():
         help="the number of tau samples")
     parser.add_argument("--num-tau-prime-samples", type=int, default=64,
         help="the number of tau prime samples")
-    parser.add_argument("--kappa", type=int, default=1.0,
-        help="the kappa value for the huber loss")
     args = parser.parse_args()
     # fmt: on
     return args
@@ -139,14 +137,13 @@ class CosineEmbeddingNetwork(nn.Module):
             nn.Linear(num_cosines, 3136),
             nn.ReLU(),
         )
-        self.num_cosines = num_cosines
+        i_pi = np.pi * torch.arange(start=1, end=num_cosines + 1).reshape(1, 1, self.num_cosines)  # (1, 1, num_cosines)
+        self.register_buffer("i_pi", i_pi)
 
     def forward(self, taus):
         # Compute cos(i * pi * tau)
-        i_pi = np.pi * torch.arange(start=1, end=self.num_cosines + 1, device=taus.device)
-        i_pi = i_pi.reshape(1, 1, self.num_cosines)  # (1, 1, num_cosines)
         taus = torch.unsqueeze(taus, dim=-1)  # (batch_size, num_tau_samples, 1)
-        cosines = torch.cos(taus * i_pi)  # (batch_size, num_tau_samples, num_cosines)
+        cosines = torch.cos(taus * self.i_pi)  # (batch_size, num_tau_samples, num_cosines)
 
         # Compute embeddings of taus
         cosines = torch.flatten(cosines, end_dim=1)  # (batch_size * num_tau_samples, num_cosines)
@@ -323,10 +320,8 @@ if __name__ == "__main__":
                 td_errors = target_action_quantiles.unsqueeze(-2).detach() - current_action_quantiles.unsqueeze(-1)
 
                 # Compute quantile Huber loss
-                huber_loss = torch.where(
-                    torch.abs(td_errors) <= args.kappa, td_errors**2, args.kappa * (torch.abs(td_errors) - 0.5 * args.kappa)
-                )
-                quantile_huber_loss = torch.abs(taus[..., None] - (td_errors.detach() < 0).float()) * huber_loss / args.kappa
+                huber_loss = torch.where(torch.abs(td_errors) <= 1.0, td_errors**2, (torch.abs(td_errors) - 0.5))
+                quantile_huber_loss = torch.abs(taus[..., None] - (td_errors.detach() < 0).float()) * huber_loss
                 batch_quantile_huber_loss = torch.sum(quantile_huber_loss, dim=1)
                 loss = torch.mean(batch_quantile_huber_loss)
 
@@ -352,7 +347,6 @@ if __name__ == "__main__":
                         target_network_param.data.copy_(
                             args.tau * network_param.data + (1.0 - args.tau) * target_network_param.data
                         )
-
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
