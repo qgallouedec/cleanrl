@@ -137,7 +137,7 @@ class CosineEmbeddingNetwork(nn.Module):
             nn.Linear(num_cosines, 3136),
             nn.ReLU(),
         )
-        i_pi = np.pi * torch.arange(start=1, end=num_cosines + 1).reshape(1, 1, self.num_cosines)  # (1, 1, num_cosines)
+        i_pi = np.pi * torch.arange(start=1, end=num_cosines + 1).reshape(1, 1, num_cosines)  # (1, 1, num_cosines)
         self.register_buffer("i_pi", i_pi)
 
     def forward(self, taus):
