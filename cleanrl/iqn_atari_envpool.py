@@ -261,7 +261,7 @@ if __name__ == "__main__":
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             embeddings = q_network(torch.Tensor(obs).to(device))
-            taus = torch.rand(1, args.num_quantile_samples, device=device)
+            taus = torch.rand(envs.num_envs, args.num_quantile_samples, device=device)
             tau_embeddings = cosine_network(taus)
             quantiles = quantile_network(embeddings, tau_embeddings)  # (num_quantile_samples, num_actions)
             q_values = torch.mean(quantiles, dim=1)  # (num_actions,)
