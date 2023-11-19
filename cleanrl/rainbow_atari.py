@@ -284,16 +284,13 @@ class QNetwork(nn.Module):
         self.value_stream = nn.Sequential(NoisyLinear(3136, 512), nn.ReLU(), NoisyLinear(512, n_atoms))
         self.advantage_stream = nn.Sequential(NoisyLinear(3136, 512), nn.ReLU(), NoisyLinear(512, self.n * n_atoms))
 
-    def get_action(self, x, action=None):
+    def get_action(self, x):
         x = self.shared_layers(x / 255.0)
         value = self.value_stream(x).view(-1, 1, self.n_atoms)
         advantages = self.advantage_stream(x).view(-1, self.n, self.n_atoms)
         q_values_distributions = value + (advantages - advantages.mean(dim=1, keepdim=True))
         q_values = (torch.softmax(q_values_distributions, dim=2) * self.atoms).sum(2)
-
-        if action is None:
-            action = torch.argmax(q_values, 1)
-        return action, torch.softmax(q_values_distributions[torch.arange(len(x)), action], dim=1)
+        return torch.argmax(q_values, 1)
 
     def get_distribution(self, obs):
         x = self.shared_layers(obs / 255.0)
@@ -358,7 +355,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
     obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
-        actions, pmf = q_network.get_action(torch.Tensor(obs).to(device))
+        actions = q_network.get_action(torch.Tensor(obs).to(device))
         actions = actions.cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
