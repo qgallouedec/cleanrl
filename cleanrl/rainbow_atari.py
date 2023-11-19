@@ -4,20 +4,14 @@ import os
 import random
 import time
 from distutils.util import strtobool
+from types import SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from stable_baselines3.common.atari_wrappers import (
-    ClipRewardEnv,
-    EpisodicLifeEnv,
-    FireResetEnv,
-    MaxAndSkipEnv,
-    NoopResetEnv,
-)
-from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common.atari_wrappers import ClipRewardEnv, EpisodicLifeEnv, FireResetEnv, MaxAndSkipEnv, NoopResetEnv
 from torch.utils.tensorboard import SummaryWriter
 from torchrl.modules import NoisyLinear
 
@@ -26,9 +20,9 @@ from torchrl.modules import NoisyLinear
 # Distributional DQN (C51)
 # Noisy Nets
 # Double Q-Learning
+# Prioritized Experience Replay
 
 # RAINBOW: Missing components:
-# Prioritized Experience Replay
 # Multi-step Learning
 
 
@@ -123,6 +117,103 @@ def make_env(env_id, seed, idx, capture_video, run_name):
     return thunk
 
 
+class SumTree:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1)
+        self.data = np.zeros(capacity, dtype=object)
+        self.write = 0
+
+    def _propagate(self, idx, change):
+        parent = (idx - 1) // 2
+        self.tree[parent] += change
+        if parent != 0:
+            self._propagate(parent, change)
+
+    def update(self, idx, priority):
+        change = priority - self.tree[idx]
+        self.tree[idx] = priority
+        self._propagate(idx, change)
+
+    def add(self, priority, data):
+        idx = self.write + self.capacity - 1
+        self.data[self.write] = data
+        self.update(idx, priority)
+        self.write += 1
+        if self.write >= self.capacity:
+            self.write = 0
+
+    def get_leaf(self, s):
+        idx = 0
+        while idx < self.capacity - 1:
+            left = 2 * idx + 1
+            right = left + 1
+            if s <= self.tree[left]:
+                idx = left
+            else:
+                s -= self.tree[left]
+                idx = right
+        return idx, self.tree[idx], self.data[idx - self.capacity + 1]
+
+    def total_priority(self):
+        return self.tree[0]
+
+
+class PrioritizedReplayBuffer:
+    def __init__(self, buffer_size, device, alpha=0.6):
+        self.tree = SumTree(buffer_size)
+        self.device = device
+        self.alpha = alpha
+        self.epsilon = 1e-5
+        self.beta = 0.4
+
+    def add(self, obs, next_obs, actions, rewards, terminations, infos):
+        max_priority = np.max(self.tree.tree[-self.tree.capacity :])
+        if max_priority == 0:
+            max_priority = 1.0
+        for idx in range(len(obs)):
+            data = (obs[idx], next_obs[idx], actions[idx], rewards[idx], terminations[idx])
+            self.tree.add(max_priority, data)
+
+    def sample(self, batch_size):
+        batch = []
+        idxs = []
+        priorities = []
+        segment = self.tree.total_priority() / batch_size
+        for i in range(batch_size):
+            a = segment * i
+            b = segment * (i + 1)
+            s = random.uniform(a, b)
+            idx, p, data = self.tree.get_leaf(s)
+            priorities.append(p)
+            batch.append(data)
+            idxs.append(idx)
+
+        sampling_probabilities = priorities / self.tree.total_priority()
+        is_weights = np.power(self.tree.capacity * sampling_probabilities, -self.beta)
+        is_weights /= is_weights.max()
+
+        obs, next_obs, actions, rewards, dones = zip(*batch)
+        obs = np.array(obs, dtype=np.float32)
+        next_obs = np.array(next_obs, dtype=np.float32)
+        data = SimpleNamespace(
+            observations=torch.from_numpy(obs).to(self.device),
+            next_observations=torch.from_numpy(next_obs).to(self.device),
+            actions=torch.tensor(actions, dtype=torch.int64, device=self.device)[:, None],
+            rewards=torch.tensor(rewards, dtype=torch.float32, device=self.device)[:, None],
+            dones=torch.tensor(dones, dtype=torch.float32, device=self.device)[:, None],
+        )
+
+        weights = torch.tensor(is_weights, dtype=torch.float32, device=self.device).view(-1, 1)
+        return data, weights, idxs
+
+    def update_priorities(self, idxs, errors):
+        errors += self.epsilon
+        for idx, error in zip(idxs, errors):
+            p = np.power(error, self.alpha)
+            self.tree.update(idx, p)
+
+
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
     def __init__(self, env, n_atoms=101, v_min=-100, v_max=100):
@@ -159,13 +250,13 @@ class QNetwork(nn.Module):
 
     def get_action(self, x, action=None):
         x = self.shared_layers(x / 255.0)
-        
+
         value = self.value_stream(x).view(-1, 1, self.n_atoms)
         advantages = self.advantage_stream(x).view(-1, self.n, self.n_atoms)
 
         # Combine value and advantages
         q_values_distributions = value + (advantages - advantages.mean(dim=1, keepdim=True))
-        
+
         # Compute Q-values by summing over the distributions
         q_values = (torch.softmax(q_values_distributions, dim=2) * self.atoms).sum(2)
 
@@ -228,14 +319,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
     target_network = QNetwork(envs, n_atoms=args.n_atoms, v_min=args.v_min, v_max=args.v_max).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
-        optimize_memory_usage=True,
-        handle_timeout_termination=False,
-    )
+    rb = PrioritizedReplayBuffer(args.buffer_size, device)
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
@@ -272,7 +356,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
-                data = rb.sample(args.batch_size)
+                data, weights, indices = rb.sample(args.batch_size)
                 with torch.no_grad():
                     action, _ = q_network.get_action(data.next_observations)
                     _, next_pmfs = target_network.get_action(data.next_observations, action)
@@ -294,7 +378,13 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                         target_pmfs[i].index_add_(0, u[i].long(), d_m_u[i])
 
                 _, old_pmfs = q_network.get_action(data.observations, data.actions.flatten())
-                loss = (-(target_pmfs * old_pmfs.clamp(min=1e-5, max=1 - 1e-5).log()).sum(-1)).mean()
+
+                expected_old_q = (old_pmfs.detach() * q_network.atoms).sum(-1)
+                expected_target_q = (target_pmfs * target_network.atoms).sum(-1)
+                td_error = expected_target_q - expected_old_q
+                rb.update_priorities(indices, td_error.abs().cpu().numpy())
+
+                loss = (weights * -(target_pmfs * old_pmfs.clamp(min=1e-5, max=1 - 1e-5).log())).sum(-1).mean()
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/loss", loss.item(), global_step)
