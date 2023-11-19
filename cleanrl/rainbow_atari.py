@@ -3,6 +3,7 @@ import argparse
 import os
 import random
 import time
+from collections import deque
 from distutils.util import strtobool
 from types import SimpleNamespace
 
@@ -21,8 +22,6 @@ from torchrl.modules import NoisyLinear
 # Noisy Nets
 # Double Q-Learning
 # Prioritized Experience Replay
-
-# RAINBOW: Missing components:
 # Multi-step Learning
 
 
@@ -160,20 +159,39 @@ class SumTree:
 
 
 class PrioritizedReplayBuffer:
-    def __init__(self, buffer_size, device, alpha=0.6):
+    def __init__(self, buffer_size, device, alpha=0.6, n_step=3, gamma=0.99):
         self.tree = SumTree(buffer_size)
         self.device = device
         self.alpha = alpha
         self.epsilon = 1e-5
         self.beta = 0.4
+        self.n_step = n_step
+        self.gamma = gamma
+        self.n_step_buffer = deque(maxlen=n_step)  # Temporary buffer for n-step transitions
 
     def add(self, obs, next_obs, actions, rewards, terminations, infos):
-        max_priority = np.max(self.tree.tree[-self.tree.capacity :])
-        if max_priority == 0:
-            max_priority = 1.0
-        for idx in range(len(obs)):
-            data = (obs[idx], next_obs[idx], actions[idx], rewards[idx], terminations[idx])
+        self.n_step_buffer.append((obs[0], actions[0], rewards[0], next_obs[0], terminations[0]))
+
+        # Check if n-step buffer is full or if episode is done
+        if len(self.n_step_buffer) == self.n_step or terminations[0]:
+            reward_sum = 0
+            for idx, (obs, action, reward, _, done) in enumerate(self.n_step_buffer):
+                reward_sum += (self.gamma**idx) * reward
+                if done:
+                    break
+
+            # The first element in the buffer is the oldest
+            obs, action, _, _, _ = self.n_step_buffer[0]
+            _, _, _, next_obs, done = self.n_step_buffer[-1]
+
+            max_priority = np.max(self.tree.tree[-self.tree.capacity :])
+            max_priority = max_priority if max_priority > 0 else 1.0
+            data = (obs, next_obs, action, reward_sum, done)
             self.tree.add(max_priority, data)
+
+            # Clear the buffer if episode is done
+            if terminations[0]:
+                self.n_step_buffer.clear()
 
     def sample(self, batch_size):
         batch = []
