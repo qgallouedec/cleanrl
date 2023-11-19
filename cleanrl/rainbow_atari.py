@@ -1,5 +1,6 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/c51/#c51_ataripy
 import argparse
+import math
 import os
 import random
 import time
@@ -14,15 +15,6 @@ import torch.nn as nn
 import torch.optim as optim
 from stable_baselines3.common.atari_wrappers import ClipRewardEnv, EpisodicLifeEnv, FireResetEnv, MaxAndSkipEnv, NoopResetEnv
 from torch.utils.tensorboard import SummaryWriter
-from torchrl.modules import NoisyLinear
-
-# RAINBOW: Already implemented components:
-# Dueling Networks
-# Distributional DQN (C51)
-# Noisy Nets
-# Double Q-Learning
-# Prioritized Experience Replay
-# Multi-step Learning
 
 
 def parse_args():
@@ -74,12 +66,6 @@ def parse_args():
         help="the timesteps it takes to update the target network")
     parser.add_argument("--batch-size", type=int, default=32,
         help="the batch size of sample from the reply memory")
-    parser.add_argument("--start-e", type=float, default=1,
-        help="the starting epsilon for exploration")
-    parser.add_argument("--end-e", type=float, default=0.01,
-        help="the ending epsilon for exploration")
-    parser.add_argument("--exploration-fraction", type=float, default=0.10,
-        help="the fraction of `total-timesteps` it takes from start-e to go end-e")
     parser.add_argument("--learning-starts", type=int, default=80000,
         help="timestep to start learning")
     parser.add_argument("--train-frequency", type=int, default=4,
@@ -159,20 +145,18 @@ class SumTree:
 
 
 class PrioritizedReplayBuffer:
-    def __init__(self, buffer_size, device, alpha=0.6, n_step=3, gamma=0.99):
+    def __init__(self, buffer_size, device, alpha=0.6, beta=0.4, n_step=3, gamma=0.99):
         self.tree = SumTree(buffer_size)
         self.device = device
         self.alpha = alpha
-        self.epsilon = 1e-5
-        self.beta = 0.4
+        self.beta = beta
         self.n_step = n_step
         self.gamma = gamma
-        self.n_step_buffer = deque(maxlen=n_step)  # Temporary buffer for n-step transitions
+        self.n_step_buffer = deque(maxlen=n_step)
 
     def add(self, obs, next_obs, actions, rewards, terminations, infos):
         self.n_step_buffer.append((obs[0], actions[0], rewards[0], next_obs[0], terminations[0]))
 
-        # Check if n-step buffer is full or if episode is done
         if len(self.n_step_buffer) == self.n_step or terminations[0]:
             reward_sum = 0
             for idx, (obs, action, reward, _, done) in enumerate(self.n_step_buffer):
@@ -180,7 +164,6 @@ class PrioritizedReplayBuffer:
                 if done:
                     break
 
-            # The first element in the buffer is the oldest
             obs, action, _, _, _ = self.n_step_buffer[0]
             _, _, _, next_obs, done = self.n_step_buffer[-1]
 
@@ -189,7 +172,6 @@ class PrioritizedReplayBuffer:
             data = (obs, next_obs, action, reward_sum, done)
             self.tree.add(max_priority, data)
 
-            # Clear the buffer if episode is done
             if terminations[0]:
                 self.n_step_buffer.clear()
 
@@ -226,10 +208,56 @@ class PrioritizedReplayBuffer:
         return data, weights, idxs
 
     def update_priorities(self, idxs, errors):
-        errors += self.epsilon
         for idx, error in zip(idxs, errors):
-            p = np.power(error, self.alpha)
+            p = np.power(error + 1e-5, self.alpha)
             self.tree.update(idx, p)
+
+
+class NoisyLinear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features)
+        self.std_init = 0.1
+
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features, requires_grad=True))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features, requires_grad=True))
+        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features, requires_grad=True))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features, requires_grad=True))
+        self.register_buffer("bias_epsilon", torch.empty(out_features))
+
+        self.reset_parameters()
+        self.reset_noise()
+
+    def reset_parameters(self):
+        mu_range = 1 / math.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.weight_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_sigma.data.fill_(self.std_init / math.sqrt(self.out_features))
+
+    def reset_noise(self):
+        epsilon_in = self._scale_noise(self.in_features)
+        epsilon_out = self._scale_noise(self.out_features)
+        self.weight_epsilon.copy_(epsilon_out.outer(epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
+
+    def _scale_noise(self, size):
+        x = torch.randn(size, device=self.weight_mu.device)
+        return x.sign().mul_(x.abs().sqrt_())
+
+    @property
+    def weight(self):
+        if self.training:
+            return self.weight_mu + self.weight_sigma * self.weight_epsilon
+        else:
+            return self.weight_mu
+
+    @property
+    def bias(self):
+        if self.training:
+            return self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            return self.bias_mu
 
 
 # ALGO LOGIC: initialize agent here:
@@ -241,7 +269,6 @@ class QNetwork(nn.Module):
         self.register_buffer("atoms", torch.linspace(v_min, v_max, steps=n_atoms))
         self.n = env.single_action_space.n
 
-        # Shared initial layers (convolutional layers)
         self.shared_layers = nn.Sequential(
             nn.Conv2d(4, 32, 8, stride=4),
             nn.ReLU(),
@@ -251,41 +278,19 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Flatten(),
         )
-
-        # Value stream (outputting a single value distribution)
-        self.value_stream = nn.Sequential(
-            NoisyLinear(3136, 512),
-            nn.ReLU(),
-            NoisyLinear(512, n_atoms),  # Outputs a distribution over values
-        )
-
-        # Advantage stream (outputting a distribution over advantages for each action)
-        self.advantage_stream = nn.Sequential(
-            NoisyLinear(3136, 512),
-            nn.ReLU(),
-            NoisyLinear(512, self.n * n_atoms),  # Outputs a distribution over advantages for each action
-        )
+        self.value_stream = nn.Sequential(NoisyLinear(3136, 512), nn.ReLU(), NoisyLinear(512, n_atoms))
+        self.advantage_stream = nn.Sequential(NoisyLinear(3136, 512), nn.ReLU(), NoisyLinear(512, self.n * n_atoms))
 
     def get_action(self, x, action=None):
         x = self.shared_layers(x / 255.0)
-
         value = self.value_stream(x).view(-1, 1, self.n_atoms)
         advantages = self.advantage_stream(x).view(-1, self.n, self.n_atoms)
-
-        # Combine value and advantages
         q_values_distributions = value + (advantages - advantages.mean(dim=1, keepdim=True))
-
-        # Compute Q-values by summing over the distributions
         q_values = (torch.softmax(q_values_distributions, dim=2) * self.atoms).sum(2)
 
         if action is None:
             action = torch.argmax(q_values, 1)
         return action, torch.softmax(q_values_distributions[torch.arange(len(x)), action], dim=1)
-
-
-def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
-    slope = (end_e - start_e) / duration
-    return max(slope * t + start_e, end_e)
 
 
 if __name__ == "__main__":
@@ -406,8 +411,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/loss", loss.item(), global_step)
-                    old_val = (old_pmfs * q_network.atoms).sum(1)
-                    writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
+                    writer.add_scalar("losses/q_values", expected_old_q.mean().item(), global_step)
                     print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
