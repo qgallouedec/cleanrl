@@ -284,11 +284,8 @@ class QNetwork(nn.Module):
         self.value_stream = nn.Sequential(NoisyLinear(3136, 512), nn.ReLU(), NoisyLinear(512, n_atoms))
         self.advantage_stream = nn.Sequential(NoisyLinear(3136, 512), nn.ReLU(), NoisyLinear(512, self.n * n_atoms))
 
-    def get_action(self, x):
-        x = self.shared_layers(x / 255.0)
-        value = self.value_stream(x).view(-1, 1, self.n_atoms)
-        advantages = self.advantage_stream(x).view(-1, self.n, self.n_atoms)
-        q_values_distributions = value + (advantages - advantages.mean(dim=1, keepdim=True))
+    def get_action(self, obs):
+        q_values_distributions = self.get_distribution(obs)
         q_values = (torch.softmax(q_values_distributions, dim=2) * self.atoms).sum(2)
         return torch.argmax(q_values, 1)
 
