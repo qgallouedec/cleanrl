@@ -15,6 +15,8 @@ import torch.nn as nn
 import torch.optim as optim
 from stable_baselines3.common.atari_wrappers import ClipRewardEnv, EpisodicLifeEnv, FireResetEnv, MaxAndSkipEnv, NoopResetEnv
 from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
+import torch.nn.init as init
 
 
 def parse_args():
@@ -213,27 +215,29 @@ class PrioritizedReplayBuffer:
             self.tree.update(idx, p)
 
 
-class NoisyLinear(nn.Linear):
-    def __init__(self, in_features, out_features):
-        super().__init__(in_features, out_features)
-        self.std_init = 0.1
+class NoisyLinear(nn.Module):
+    def __init__(self, in_features, out_features, std_init=0.1):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.std_init = std_init
 
-        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features, requires_grad=True))
-        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features, requires_grad=True))
-        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
-        self.bias_mu = nn.Parameter(torch.empty(out_features, requires_grad=True))
-        self.bias_sigma = nn.Parameter(torch.empty(out_features, requires_grad=True))
-        self.register_buffer("bias_epsilon", torch.empty(out_features))
+        self.weight_mu = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.register_buffer("weight_epsilon", torch.Tensor(out_features, in_features))
+
+        self.bias_mu = nn.Parameter(torch.Tensor(out_features))
+        self.bias_sigma = nn.Parameter(torch.Tensor(out_features))
+        self.register_buffer("bias_epsilon", torch.Tensor(out_features))
 
         self.reset_parameters()
         self.reset_noise()
 
     def reset_parameters(self):
-        mu_range = 1 / math.sqrt(self.in_features)
-        self.weight_mu.data.uniform_(-mu_range, mu_range)
-        self.weight_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
-        self.bias_mu.data.uniform_(-mu_range, mu_range)
-        self.bias_sigma.data.fill_(self.std_init / math.sqrt(self.out_features))
+        init.kaiming_uniform_(self.weight_mu, a=math.sqrt(5))
+        init.constant_(self.weight_sigma, self.std_init / math.sqrt(self.in_features))
+        init.constant_(self.bias_mu, 0)
+        init.constant_(self.bias_sigma, self.std_init / math.sqrt(self.out_features))
 
     def reset_noise(self):
         epsilon_in = self._scale_noise(self.in_features)
@@ -245,19 +249,10 @@ class NoisyLinear(nn.Linear):
         x = torch.randn(size, device=self.weight_mu.device)
         return x.sign().mul_(x.abs().sqrt_())
 
-    @property
-    def weight(self):
-        if self.training:
-            return self.weight_mu + self.weight_sigma * self.weight_epsilon
-        else:
-            return self.weight_mu
-
-    @property
-    def bias(self):
-        if self.training:
-            return self.bias_mu + self.bias_sigma * self.bias_epsilon
-        else:
-            return self.bias_mu
+    def forward(self, input):
+        weight = self.weight_mu + self.weight_sigma * self.weight_epsilon if self.training else self.weight_mu
+        bias = self.bias_mu + self.bias_sigma * self.bias_epsilon if self.training else self.bias_mu
+        return F.linear(input, weight, bias)
 
 
 # ALGO LOGIC: initialize agent here:
