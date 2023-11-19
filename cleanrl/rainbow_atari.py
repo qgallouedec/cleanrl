@@ -284,6 +284,11 @@ class QNetwork(nn.Module):
         self.value_stream = nn.Sequential(NoisyLinear(3136, 512), nn.ReLU(), NoisyLinear(512, n_atoms))
         self.advantage_stream = nn.Sequential(NoisyLinear(3136, 512), nn.ReLU(), NoisyLinear(512, self.n * n_atoms))
 
+    def reset_noise(self):
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
+
     def get_action(self, obs):
         q_values_distributions = self.get_distribution(obs)
         q_values = (torch.softmax(q_values_distributions, dim=2) * self.atoms).sum(2)
@@ -431,6 +436,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                q_network.reset_noise()
 
             # update target network
             if global_step % args.target_network_frequency == 0:
