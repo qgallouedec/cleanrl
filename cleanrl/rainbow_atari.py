@@ -12,11 +12,11 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
 import torch.optim as optim
 from stable_baselines3.common.atari_wrappers import ClipRewardEnv, EpisodicLifeEnv, FireResetEnv, MaxAndSkipEnv, NoopResetEnv
 from torch.utils.tensorboard import SummaryWriter
-import torch.nn.functional as F
-import torch.nn.init as init
 
 
 def parse_args():
@@ -106,113 +106,121 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 class SumTree:
     def __init__(self, capacity):
-        self.capacity = capacity
-        self.tree = np.zeros(2 * capacity - 1)
-        self.data = np.zeros(capacity, dtype=object)
-        self.write = 0
+        self.capacity = capacity  # Capacity of the sum tree (number of leaves)
+        self.tree = [0] * (2 * capacity)  # Binary tree representation
+        self.max_priority = 1.0  # Initial max priority for new experiences
+
+    def update(self, index, priority=None):
+        if priority is None:
+            priority = self.max_priority
+        tree_idx = index + self.capacity
+        change = priority - self.tree[tree_idx]
+        self.tree[tree_idx] = priority
+        self._propagate(tree_idx, change)
+        self.max_priority = max(self.max_priority, priority)
 
     def _propagate(self, idx, change):
-        parent = (idx - 1) // 2
-        self.tree[parent] += change
-        if parent != 0:
-            self._propagate(parent, change)
+        parent = idx // 2
+        while parent != 0:
+            self.tree[parent] += change
+            parent = parent // 2
 
-    def update(self, idx, priority):
-        change = priority - self.tree[idx]
-        self.tree[idx] = priority
-        self._propagate(idx, change)
+    def total(self):
+        return self.tree[1]  # The root of the tree holds the total sum
 
-    def add(self, priority, data):
-        idx = self.write + self.capacity - 1
-        self.data[self.write] = data
-        self.update(idx, priority)
-        self.write += 1
-        if self.write >= self.capacity:
-            self.write = 0
-
-    def get_leaf(self, s):
-        idx = 0
-        while idx < self.capacity - 1:
-            left = 2 * idx + 1
+    def get(self, s):
+        idx = 1
+        while idx < self.capacity:  # Keep moving down the tree to find the index
+            left = 2 * idx
             right = left + 1
-            if s <= self.tree[left]:
+            if self.tree[left] >= s:
                 idx = left
             else:
                 s -= self.tree[left]
                 idx = right
-        return idx, self.tree[idx], self.data[idx - self.capacity + 1]
-
-    def total_priority(self):
-        return self.tree[0]
+        return idx - self.capacity
 
 
 class PrioritizedReplayBuffer:
-    def __init__(self, buffer_size, device, alpha=0.6, beta=0.4, n_step=3, gamma=0.99):
-        self.tree = SumTree(buffer_size)
+    def __init__(self, size, device, alpha=0.5, beta_0=0.4, n_step=3, gamma=0.99):
+        self.size = size
         self.device = device
         self.alpha = alpha
-        self.beta = beta
+        self.beta_0 = beta_0
+        self.update_beta(0.0)
         self.n_step = n_step
         self.gamma = gamma
+
+        self.next_index = 0
+        self.sum_tree = SumTree(size)
+        self.observations = np.zeros((self.size, 4, 84, 84), dtype=np.uint8)
+        self.next_observations = np.zeros((self.size, 4, 84, 84), dtype=np.uint8)
+        self.actions = np.zeros((self.size, 1), dtype=np.int64)
+        self.rewards = np.zeros((self.size, 1), dtype=np.float32)
+        self.dones = np.zeros((self.size, 1), dtype=bool)
+
         self.n_step_buffer = deque(maxlen=n_step)
 
-    def add(self, obs, next_obs, actions, rewards, terminations, infos):
-        self.n_step_buffer.append((obs[0], actions[0], rewards[0], next_obs[0], terminations[0]))
+    def add(self, obs, next_obs, actions, rewards, dones, infos):
+        self.n_step_buffer.append((obs[0], next_obs[0], actions[0], rewards[0], dones[0], infos))
 
-        if len(self.n_step_buffer) == self.n_step or terminations[0]:
-            reward_sum = 0
-            for idx, (obs, action, reward, _, done) in enumerate(self.n_step_buffer):
-                reward_sum += (self.gamma**idx) * reward
-                if done:
-                    break
+        if len(self.n_step_buffer) < self.n_step and not dones[0]:
+            return
 
-            obs, action, _, _, _ = self.n_step_buffer[0]
-            _, _, _, next_obs, done = self.n_step_buffer[-1]
+        # Compute n-step return and the first state and action
+        rewards = [self.n_step_buffer[i][3] for i in range(len(self.n_step_buffer))]
+        n_step_return = sum([r * (self.gamma**i) for i, r in enumerate(rewards)])
+        obs, _, action, _, _, _ = self.n_step_buffer[0]
+        _, next_obs, _, _, done, _ = self.n_step_buffer[-1]
 
-            max_priority = np.max(self.tree.tree[-self.tree.capacity :])
-            max_priority = max_priority if max_priority > 0 else 1.0
-            data = (obs, next_obs, action, reward_sum, done)
-            self.tree.add(max_priority, data)
+        # Store the n-step transition
+        self.observations[self.next_index] = obs
+        self.next_observations[self.next_index] = next_obs
+        self.actions[self.next_index] = action
+        self.rewards[self.next_index] = n_step_return
+        self.dones[self.next_index] = done
 
-            if terminations[0]:
-                self.n_step_buffer.clear()
+        # Get the max priority in the tree and set the new transition with max priority
+        self.sum_tree.update(self.next_index)
+        self.next_index = (self.next_index + 1) % self.size
+
+        if dones[0]:
+            self.n_step_buffer.clear()
 
     def sample(self, batch_size):
-        batch = []
+        segment = self.sum_tree.total() / batch_size
         idxs = []
         priorities = []
-        segment = self.tree.total_priority() / batch_size
         for i in range(batch_size):
             a = segment * i
             b = segment * (i + 1)
             s = random.uniform(a, b)
-            idx, p, data = self.tree.get_leaf(s)
-            priorities.append(p)
-            batch.append(data)
+            idx = self.sum_tree.get(s)
             idxs.append(idx)
+            leaf_idx = idx + self.size  # Adjusting index to point to the leaf node
+            priorities.append(self.sum_tree.tree[leaf_idx])
 
-        sampling_probabilities = priorities / self.tree.total_priority()
-        is_weights = np.power(self.tree.capacity * sampling_probabilities, -self.beta)
-        is_weights /= is_weights.max()
+        priorities = torch.tensor(priorities, dtype=torch.float32, device=self.device).unsqueeze(1)
+        sampling_probabilities = priorities / self.sum_tree.total()
+        weights = (self.size * sampling_probabilities) ** (-self.beta)
+        weights /= weights.max()  # Normalize for stability
 
-        obs, next_obs, actions, rewards, dones = zip(*batch)
-        obs = np.array(obs, dtype=np.float32)
-        next_obs = np.array(next_obs, dtype=np.float32)
         data = SimpleNamespace(
-            observations=torch.from_numpy(obs).to(self.device),
-            next_observations=torch.from_numpy(next_obs).to(self.device),
-            actions=torch.tensor(actions, dtype=torch.int64, device=self.device)[:, None],
-            rewards=torch.tensor(rewards, dtype=torch.float32, device=self.device)[:, None],
-            dones=torch.tensor(dones, dtype=torch.float32, device=self.device)[:, None],
+            observations=torch.from_numpy(self.observations[idxs]).to(self.device),
+            next_observations=torch.from_numpy(self.next_observations[idxs]).to(self.device),
+            actions=torch.from_numpy(self.actions[idxs]).to(self.device),
+            rewards=torch.from_numpy(self.rewards[idxs]).to(self.device),
+            dones=torch.from_numpy(self.dones[idxs]).to(self.device),
         )
-
-        weights = torch.tensor(is_weights, dtype=torch.float32, device=self.device).view(-1, 1)
-        return data, weights, idxs
+        return data, idxs, weights
 
     def update_priorities(self, idxs, errors):
         for idx, error in zip(idxs, errors):
-            p = np.power(error + 1e-5, self.alpha)
-            self.tree.update(idx, p)
+            priority = (abs(error) + 1e-5) ** self.alpha
+            self.sum_tree.update(idx, priority)
+
+    def update_beta(self, fraction):
+        self.beta = (1.0 - self.beta_0) * fraction + self.beta_0
 
 
 class NoisyLinear(nn.Module):
@@ -374,11 +382,11 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
-                data, weights, indices = rb.sample(args.batch_size)
+                data, idxs, weights = rb.sample(args.batch_size)
                 with torch.no_grad():
                     action, _ = q_network.get_action(data.next_observations)
                     _, next_pmfs = target_network.get_action(data.next_observations, action)
-                    next_atoms = data.rewards + args.gamma * target_network.atoms * (1 - data.dones)
+                    next_atoms = data.rewards + args.gamma * target_network.atoms * (1 - data.dones.float())
                     # projection
                     delta_z = target_network.atoms[1] - target_network.atoms[0]
                     tz = next_atoms.clamp(args.v_min, args.v_max)
@@ -400,7 +408,8 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                 expected_old_q = (old_pmfs.detach() * q_network.atoms).sum(-1)
                 expected_target_q = (target_pmfs * target_network.atoms).sum(-1)
                 td_error = expected_target_q - expected_old_q
-                rb.update_priorities(indices, td_error.abs().cpu().numpy())
+                rb.update_priorities(idxs, td_error.abs().cpu().numpy())
+                rb.update_beta(global_step / args.total_timesteps)
 
                 loss = (weights * -(target_pmfs * old_pmfs.clamp(min=1e-5, max=1 - 1e-5).log())).sum(-1).mean()
 
