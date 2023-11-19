@@ -295,6 +295,12 @@ class QNetwork(nn.Module):
             action = torch.argmax(q_values, 1)
         return action, torch.softmax(q_values_distributions[torch.arange(len(x)), action], dim=1)
 
+    def get_distribution(self, obs):
+        x = self.shared_layers(obs / 255.0)
+        value = self.value_stream(x).view(-1, 1, self.n_atoms)
+        advantages = self.advantage_stream(x).view(-1, self.n, self.n_atoms)
+        return value + (advantages - advantages.mean(dim=1, keepdim=True))
+
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
@@ -383,9 +389,17 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
                 data, idxs, weights = rb.sample(args.batch_size)
+
+                # Combine observations for a single network call
+                combined_obs = torch.cat([data.observations, data.next_observations], dim=0)
+                combined_dist = q_network.get_distribution(combined_obs)
+                dist, next_dist = combined_dist.split(len(data.observations), dim=0)
+
                 with torch.no_grad():
-                    action, _ = q_network.get_action(data.next_observations)
-                    _, next_pmfs = target_network.get_action(data.next_observations, action)
+                    next_q_values = (torch.softmax(next_dist, dim=2) * q_network.atoms).sum(2)
+                    next_actions = torch.argmax(next_q_values, 1)
+                    target_next_dist = target_network.get_distribution(data.next_observations)
+                    next_pmfs = torch.softmax(target_next_dist[torch.arange(len(data.next_observations)), next_actions], dim=1)
                     next_atoms = data.rewards + args.gamma * target_network.atoms * (1 - data.dones.float())
                     # projection
                     delta_z = target_network.atoms[1] - target_network.atoms[0]
@@ -403,7 +417,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                         target_pmfs[i].index_add_(0, l[i].long(), d_m_l[i])
                         target_pmfs[i].index_add_(0, u[i].long(), d_m_u[i])
 
-                _, old_pmfs = q_network.get_action(data.observations, data.actions.flatten())
+                old_pmfs = torch.softmax(dist[torch.arange(len(data.observations)), data.actions.flatten()], dim=1)
 
                 expected_old_q = (old_pmfs.detach() * q_network.atoms).sum(-1)
                 expected_target_q = (target_pmfs * target_network.atoms).sum(-1)
