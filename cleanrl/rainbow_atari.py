@@ -214,11 +214,9 @@ class PrioritizedReplayBuffer:
         )
         return data, idxs, weights
 
-    def update_priorities(self, idxs, projected_dists, target_dists):
-        for idx, (proj_dist, targ_dist) in zip(idxs, zip(projected_dists, target_dists)):
-            kl_div = F.kl_div(proj_dist.log(), targ_dist, reduction="batchmean").item()
-            priority = (abs(kl_div) + 1e-5) ** self.alpha  # adding a small constant to avoid zero priority
-            self.sum_tree.update(idx, priority)
+    def update_priorities(self, idxs, priorities):
+        for idx, priority in zip(idxs, priorities):
+            self.sum_tree.update(idx, (abs(priority) + 1e-6) ** self.alpha)
 
     def update_beta(self, fraction):
         self.beta = (1.0 - self.beta_0) * fraction + self.beta_0
@@ -419,15 +417,15 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
 
                 old_pmfs = torch.softmax(dist[torch.arange(len(data.observations)), data.actions.flatten()], dim=1)
 
-                expected_old_q = (old_pmfs.detach() * q_network.atoms).sum(-1)
-                rb.update_priorities(idxs, old_pmfs.detach(), target_pmfs)
+                element_loss = (weights * -(target_pmfs * old_pmfs.clamp(min=1e-5, max=1 - 1e-5).log())).sum(-1)
+                rb.update_priorities(idxs, element_loss.detach().cpu().tolist())
                 rb.update_beta(global_step / args.total_timesteps)
-
-                loss = (weights * -(target_pmfs * old_pmfs.clamp(min=1e-5, max=1 - 1e-5).log())).sum(-1).mean()
+                loss = element_loss.mean()
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/loss", loss.item(), global_step)
-                    writer.add_scalar("losses/q_values", expected_old_q.mean().item(), global_step)
+                    expected_old_q = (old_pmfs.detach() * q_network.atoms).sum(-1).mean().item()
+                    writer.add_scalar("losses/q_values", expected_old_q, global_step)
                     print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
