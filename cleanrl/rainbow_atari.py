@@ -450,7 +450,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
         }
         torch.save(model_data, model_path)
         print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.c51_eval import evaluate
+        from cleanrl_utils.evals.rainbow_eval import evaluate
 
         episodic_returns = evaluate(
             model_path,
