@@ -1,4 +1,4 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/c51/#c51_ataripy
+# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/rainbow/#rainbow_ataripy
 import argparse
 import math
 import os
@@ -50,7 +50,7 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=2.5e-4,
+    parser.add_argument("--learning-rate", type=float, default=0.0000625,
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=1,
         help="the number of parallel game environments")
@@ -214,9 +214,10 @@ class PrioritizedReplayBuffer:
         )
         return data, idxs, weights
 
-    def update_priorities(self, idxs, errors):
-        for idx, error in zip(idxs, errors):
-            priority = (abs(error) + 1e-5) ** self.alpha
+    def update_priorities(self, idxs, projected_dists, target_dists):
+        for idx, (proj_dist, targ_dist) in zip(idxs, zip(projected_dists, target_dists)):
+            kl_div = F.kl_div(proj_dist.log(), targ_dist, reduction="batchmean").item()
+            priority = (abs(kl_div) + 1e-5) ** self.alpha  # adding a small constant to avoid zero priority
             self.sum_tree.update(idx, priority)
 
     def update_beta(self, fraction):
@@ -224,7 +225,7 @@ class PrioritizedReplayBuffer:
 
 
 class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, std_init=0.1):
+    def __init__(self, in_features, out_features, std_init=0.5):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -346,7 +347,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     q_network = QNetwork(envs, n_atoms=args.n_atoms, v_min=args.v_min, v_max=args.v_max).to(device)
-    optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate, eps=0.01 / args.batch_size)
+    optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate, eps=1.5e-4)
     target_network = QNetwork(envs, n_atoms=args.n_atoms, v_min=args.v_min, v_max=args.v_max).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
@@ -419,9 +420,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                 old_pmfs = torch.softmax(dist[torch.arange(len(data.observations)), data.actions.flatten()], dim=1)
 
                 expected_old_q = (old_pmfs.detach() * q_network.atoms).sum(-1)
-                expected_target_q = (target_pmfs * target_network.atoms).sum(-1)
-                td_error = expected_target_q - expected_old_q
-                rb.update_priorities(idxs, td_error.abs().cpu().numpy())
+                rb.update_priorities(idxs, old_pmfs.detach(), target_pmfs)
                 rb.update_beta(global_step / args.total_timesteps)
 
                 loss = (weights * -(target_pmfs * old_pmfs.clamp(min=1e-5, max=1 - 1e-5).log())).sum(-1).mean()
